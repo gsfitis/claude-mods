@@ -1,0 +1,17 @@
+{
+  "name": "radio",
+  "version": "0.1.0",
+  "description": "Internet radio in a pane: radio-browser.info directories and your own stations, from a feeds file",
+  "author": {
+    "name": "George Sfitis"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "resumeOnStart": {
+      "type": "boolean",
+      "title": "Resume on start",
+      "description": "When a session starts, play the station that was playing when the last one ended",
+      "default": true
+    }
+  }
+}

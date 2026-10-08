@@ -1,0 +1,4 @@
+**/.claude-plugin/types/
+node_modules/
+# Your own dropdowns; the mod falls back to the tracked feeds.default.json without it.
+radio-fm/feeds.json

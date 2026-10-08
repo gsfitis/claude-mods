@@ -1,0 +1,9 @@
+{
+  "feeds": [
+    {
+      "name": "Greek",
+      "source": "radio-browser",
+      "url": "https://all.api.radio-browser.info/json/stations/search?countrycode=GR&hidebroken=true&order=clickcount&reverse=true&limit=40"
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "name": "claude-mods",
+  "description": "Mods for Claude Code: plugins that change its own interface",
+  "owner": {
+    "name": "George Sfitis"
+  },
+  "plugins": [
+    {
+      "name": "radio",
+      "source": "./radio-fm"
+    }
+  ]
+}
