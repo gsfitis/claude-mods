@@ -177,10 +177,18 @@ const loadDirectory = async ($: EngineInterface, feed: Feed, url: string): Promi
   const { ok, status, text } = await $.http.fetch(url, { headers: { 'User-Agent': USER_AGENT } })
   if (!ok) throw new Error(`${feed.name} answered ${status}`)
 
-  const stations: DirectoryStation[] = JSON.parse(text)
+  const stations: unknown = JSON.parse(text)
+  if (!Array.isArray(stations)) throw new Error(`${feed.name} answered no station list`)
   const list: Channel[] = []
-  for (const s of stations) {
-    const tags = printable(s.tags).split(',').map(t => t.trim()).filter(Boolean).slice(0, 2).join(', ')
+  for (const s of stations as (Partial<DirectoryStation> | null)[]) {
+    // Outside data: an entry without a name or an http(s) stream is left out.
+    if (typeof s?.name !== 'string' || !isStream(s.url_resolved)) continue
+    const tags = (typeof s.tags === 'string' ? printable(s.tags) : '')
+      .split(',')
+      .map(t => t.trim())
+      .filter(Boolean)
+      .slice(0, 2)
+      .join(', ')
     const channel: Channel = {
       id: slug(s.name),
       title: printable(s.name).trim(),
@@ -194,6 +202,9 @@ const loadDirectory = async ($: EngineInterface, feed: Feed, url: string): Promi
     if (channel.id === '' || isListed) continue
     list.push(channel)
   }
+  // Nothing to list counts as a failure: asked again next time, the feed keeping
+  // its last stations meanwhile.
+  if (list.length === 0) throw new Error(`${feed.name} listed no stations`)
   directories.set(`${feed.key} ${url}`, list)
 
   return list
@@ -204,25 +215,30 @@ const fetchFeed = ($: EngineInterface, feed: Feed): Promise<Channel[]> =>
 
 // `{ "feeds": [{ "name", "source"?: "radio-browser", "url"?, "stations"?:
 // [{ "id"?, "title", "genre"?, "url" }] }] }` as dropdowns; throws without a "feeds" list.
-const parseFeeds = (config: any): { feeds: Feed[]; skipped: number } => {
+// `skipped` names each entry left out (`feed 2 "Jazz"`, `"Jazz" station 3`), so a
+// different mistake is a different toast.
+const parseFeeds = (config: any): { feeds: Feed[]; skipped: string[] } => {
   if (!Array.isArray(config?.feeds)) throw new Error('it needs a "feeds" list')
 
   const feeds: Feed[] = []
   const keys = new Set<string>()
-  let skipped = 0
-  for (const feed of config.feeds) {
+  const skipped: string[] = []
+  for (const [index, feed] of config.feeds.entries()) {
     const name = typeof feed?.name === 'string' ? printable(feed.name).trim() : ''
+    const where = name === '' ? `feed ${index + 1}` : `feed ${index + 1} "${name}"`
     const format = FORMATS.find(f => f === feed?.source)
     const isFetched = feed?.source !== undefined
     if (name === '' || (isFetched && (format === undefined || !isStream(feed.url)))) {
-      skipped += 1
+      skipped.push(where)
       continue
     }
+    // A url is only fetched with a source; without one it would be dropped unsaid.
+    if (!isFetched && feed.url !== undefined) skipped.push(`${where} "url" (no "source")`)
     const stations: Feed['stations'] = []
-    for (const s of Array.isArray(feed.stations) ? feed.stations : []) {
+    for (const [n, s] of (Array.isArray(feed.stations) ? feed.stations : []).entries()) {
       const title = typeof s?.title === 'string' ? printable(s.title).trim() : ''
       if (title === '' || !isStream(s.url)) {
-        skipped += 1
+        skipped.push(`"${name}" station ${n + 1}`)
         continue
       }
       stations.push({
@@ -234,7 +250,7 @@ const parseFeeds = (config: any): { feeds: Feed[]; skipped: number } => {
     }
     // A feed with nothing to fetch or play would leave no dropdown; it counts as skipped.
     if (!isFetched && stations.length === 0) {
-      skipped += 1
+      skipped.push(where)
       continue
     }
     feeds.push({ key: claim(keys, slug(name) || 'feed'), name, ...(isFetched ? { format, url: feed.url } : {}), stations })
@@ -246,26 +262,33 @@ const parseFeeds = (config: any): { feeds: Feed[]; skipped: number } => {
 // The dropdowns, in order, from feeds.json beside the mod (yours, untracked),
 // else feeds.default.json; read on every load of the lists, so an edit shows on
 // the next /radio-fm. A feeds.json that cannot be read falls back to the default.
+const SKIPS_SHOWN = 5
+
 const readFeeds = async ($: EngineInterface): Promise<Feed[]> => {
   const problems: string[] = []
   let feeds: Feed[] = []
+  let used: string | undefined
   for (const file of ['feeds.json', 'feeds.default.json']) {
     const path = `${$.plugin.root}/${file}`
     try {
       if (!(await $.fs.exists(path))) continue
-      const parsed = parseFeeds(JSON.parse(await $.fs.read(path)))
-      if (parsed.skipped > 0) {
+      const { feeds: parsed, skipped } = parseFeeds(JSON.parse(await $.fs.read(path)))
+      if (skipped.length > 0) {
+        const more = skipped.length > SKIPS_SHOWN ? ` and ${skipped.length - SKIPS_SHOWN} more` : ''
         problems.push(
-          `${path}: skipped ${parsed.skipped} (a feed needs a "name", and a "source" of radio-browser with an http(s) "url", or "stations"; a station, a "title" and an http(s) "url")`,
+          `${path}: skipped ${skipped.length}: ${skipped.slice(0, SKIPS_SHOWN).join(', ')}${more} (a feed needs a "name", and a "source" of radio-browser with an http(s) "url", or "stations"; a station, a "title" and an http(s) "url")`,
         )
       }
-      feeds = parsed.feeds
+      feeds = parsed
+      used = path
       break
     } catch (error) {
       problems.push(`${path}: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
-  if (feeds.length === 0 && problems.length === 0) problems.push(`no stations: add ${$.plugin.root}/feeds.json`)
+  if (feeds.length === 0 && problems.length === 0) {
+    problems.push(used === undefined ? `no stations: add ${$.plugin.root}/feeds.json` : `${used}: lists no feeds`)
+  }
   const problem = problems.join('; ')
   if (problem !== '' && problem !== feedProblem) $.ui.toast(`radio: ${problem}`)
   feedProblem = problem
@@ -283,29 +306,52 @@ const loadChannels = async ($: EngineInterface): Promise<Channel[]> => {
   const hasOwn = feeds.some(f => f.stations.length > 0)
   if (isFetching && !hasOwn && failed.length === feeds.filter(f => f.url !== undefined).length) throw failed[0]
 
-  // Ids in feeds.json's order: the first to slug to an id keeps it; a later one
-  // gets its feed's name after it, then a number.
-  const taken = new Set<string>()
-  const list: Channel[] = []
-  for (const [index, feed] of feeds.entries()) {
-    const own: Channel[] = feed.stations.map(s => ({
-      id: s.id ?? (slug(s.title) || 'station'),
-      title: s.title,
-      genre: s.genre === undefined ? feed.name : `${feed.name} · ${s.genre}`,
-      url: s.url,
-      source: feed.key,
-    }))
+  const explicit = new Map<Channel, string>()
+  const groups = feeds.map((feed, index) => {
+    const own = feed.stations.map(s => {
+      const c: Channel = {
+        id: s.id ?? (slug(s.title) || 'station'),
+        title: s.title,
+        genre: s.genre === undefined ? feed.name : `${feed.name} · ${s.genre}`,
+        url: s.url,
+        source: feed.key,
+      }
+      if (s.id !== undefined) explicit.set(c, s.id)
+
+      return c
+    })
     const result = fetched[index]
     // A feed that failed keeps the stations it gave last time.
     const remote = (result?.status === 'fulfilled' ? result.value : last.filter(c => c.source === feed.key)).filter(
       c => !own.some(o => o.id === c.id || sameStream(o.url, c.url)),
     )
-    for (const c of [...own, ...remote]) list.push({ ...c, id: claim(taken, c.id, feed.key) })
+
+    return { feed, stations: [...own, ...remote] }
+  })
+  const all = groups.flatMap(g => g.stations)
+  const sameAs = (a: Channel, b: Channel): boolean => a.source === b.source && sameStream(a.url, b.url)
+  // Ids in four rounds, so no edit or late answer moves one a station holds: the
+  // station playing keeps its id until it stops, listed or not; then an own
+  // station's "id"; then the id the last load gave the same stream in the same
+  // feed (and title, for one stream listed twice); then, in feeds.json's order,
+  // the slug, with the feed's key after it once taken, then a number.
+  const taken = new Set<string>()
+  const ids = new Map<Channel, string>()
+  const reserve = (c: Channel, id: string | undefined): void => {
+    if (id === undefined || ids.has(c) || taken.has(id)) return
+    taken.add(id)
+    ids.set(c, id)
   }
-  // The playing station stays listed when its source drops it (a refreshed top
-  // 40, a retired channel, a feed edited away), or the pane would say "Radio off" over the music.
-  const tuned = last.find(c => c.id === playing)
-  if (tuned !== undefined && !list.some(c => c.id === tuned.id)) list.push(tuned)
+  const onAir = current
+  const playingHere = onAir && (all.find(c => sameAs(c, onAir) && c.id === onAir.id) ?? all.find(c => sameAs(c, onAir)))
+  // Listed or not (a refreshed top 40, a feed edited away, a saved station): the
+  // pane, the band and the tick name it by `current` when no list does.
+  if (playingHere !== undefined && onAir !== undefined) reserve(playingHere, onAir.id)
+  else if (onAir !== undefined) taken.add(onAir.id)
+  all.forEach(c => reserve(c, explicit.get(c)))
+  all.forEach(c => reserve(c, (last.find(p => sameAs(p, c) && p.title === c.title) ?? last.find(p => sameAs(p, c)))?.id))
+  for (const { feed, stations } of groups) for (const c of stations) if (!ids.has(c)) ids.set(c, claim(taken, c.id, feed.key))
+  const list = all.map(c => ({ ...c, id: ids.get(c) ?? c.id }))
   await update($, pickers, () => feeds.map(feed => ({ source: feed.key, label: feed.name })))
   await update($, channels, () => list)
 
@@ -332,12 +378,21 @@ const clip = (text: string, room: number): string =>
 
 // Narrower than this (a sidebar docked beside the transcript), the pane goes compact.
 const COMPACT_BELOW = 48
+// A dropdown's name is cut to this, so one long name never pads the others' station out of view.
+const LABEL_MAX = 15
 
 // The child dies with the module, so these only mirror what is playing now;
 // `station` in $.state is the truth, and a reload resumes from it.
 let playing: string | null = null
+// What plays, whole: the one handle on it no reload of the lists can move. It
+// outlives /clear, as the cvlc does.
+let current: Channel | undefined
+// The station `id` names: as listed, else saved whole, else the one playing.
+const playingAs = (id: string | null): Channel | undefined => (id !== null && current?.id === id ? current : undefined)
 let player: HookStream<ProcessSpawnChunk, ProcessSpawnResult> | undefined
 let fetchedAt = 0
+// When the tick last asked for the lists because it had none.
+let emptyTriedAt: number | undefined
 let isBusy = false
 // The playing VLC's pid (its shell wrapper prints it), its MPRIS bus name once
 // found, and the volume it last took.
@@ -483,6 +538,7 @@ const tune = ($: EngineInterface, channel: Channel | undefined): void => {
   player?.return({ code: null, signal: 'SIGTERM' }).catch(ignore)
   player = undefined
   playing = channel?.id ?? null
+  current = channel
   childPid = undefined
   childBus = undefined
   appliedVolume = null
@@ -555,6 +611,7 @@ const tune = ($: EngineInterface, channel: Channel | undefined): void => {
     // Forget the dead child at once, so picking the same station again replays it.
     player = undefined
     playing = null
+    current = undefined
     childPid = undefined
     childBus = undefined
     appliedVolume = null
@@ -589,15 +646,28 @@ export const register: Register = (on, options) => {
         if (wanted !== null && wanted !== unusedResume) unusedResume = undefined
         const now = await $.clock.now()
         let list = await read($, channels)
-        if (wanted !== null && list.length === 0) list = await loadChannels($)
+        // What plays without the lists: a station saved whole, or the one playing.
+        const known = (await savedStations($)).find(c => c.id === wanted) ?? playingAs(wanted)
+        // An empty list may be all there is (no feeds, every one down): asked again
+        // once per REFRESH_MS, not every second; in the background when something
+        // can play already, so a slow network never holds Stop, mute or volume.
+        const isEmptyDue = emptyTriedAt === undefined || now - emptyTriedAt >= REFRESH_MS
+        const isEmptyTried = wanted !== null && list.length === 0 && isEmptyDue
+        if (isEmptyTried) {
+          emptyTriedAt = now
+          if (known !== undefined) loadChannels($).catch(ignore)
+          else list = await loadChannels($)
+        }
+        // A list in hand: the next empty one (after /clear) is asked for at once.
+        if (list.length > 0) emptyTriedAt = undefined
         if (playing !== null && now - fetchedAt > REFRESH_MS) {
           fetchedAt = now
           // In the background: a slow station list must never hold Stop, mute or volume.
           // A failed refresh keeps the last list; the next tick reads a new one.
           loadChannels($).catch(ignore)
         }
-        const channel = list.find(c => c.id === wanted) ?? (await savedStations($)).find(c => c.id === wanted)
-        if (wanted !== null && channel === undefined && list.length > 0) {
+        const channel = list.find(c => c.id === wanted) ?? known
+        if (wanted !== null && channel === undefined && (list.length > 0 || isEmptyTried)) {
           await update($, station, () => null)
           $.ui.toast(`radio: "${wanted}" is in neither station list right now`)
         } else if (wanted !== playing) {
@@ -695,7 +765,12 @@ export const register: Register = (on, options) => {
     try {
       list = await loadChannels($)
     } catch (error) {
-      return { text: `radio: could not load the station lists (${String(error)})` }
+      // Offline, a station saved whole in Favorites or Recent still plays, and the
+      // pane still opens on them.
+      const saved = await savedStations($)
+      const isPlayable = wanted === '' ? saved.length > 0 : saved.some(c => c.id === wanted || c.title.toLowerCase() === wanted)
+      if (!isPlayable) return { text: `radio: could not load the station lists (${String(error)})` }
+      list = []
     }
 
     if (wanted === '') {
@@ -749,7 +824,10 @@ export const register: Register = (on, options) => {
     const wanted = await read($, station)
     if (wanted === null || (await read($, isPaneOpen))) return next(e)
 
-    const tuned = (await read($, channels)).find(c => c.id === wanted) ?? (await savedStations($)).find(c => c.id === wanted)
+    const tuned =
+      (await read($, channels)).find(c => c.id === wanted) ??
+      (await savedStations($)).find(c => c.id === wanted) ??
+      playingAs(wanted)
     if (tuned === undefined) return next(e)
 
     const elements = $.ui.resolve(e)
@@ -819,7 +897,11 @@ export const register: Register = (on, options) => {
     const played = await read($, recent)
     const starred = await read($, favorites)
     const opened = await read($, openPicker)
-    const tuned = list.find(c => c.id === wanted) ?? starred.find(c => c.id === wanted) ?? played.find(c => c.id === wanted)
+    const tuned =
+      list.find(c => c.id === wanted) ??
+      starred.find(c => c.id === wanted) ??
+      played.find(c => c.id === wanted) ??
+      playingAs(wanted)
     const isStarred = starred.some(c => c.id === tuned?.id)
     const isLive = tuned !== undefined && percent === null
     const isCompact = e.props.bodyColumns < COMPACT_BELOW
@@ -833,7 +915,7 @@ export const register: Register = (on, options) => {
     const results = search(searchable, text)
     const dropdowns = await read($, pickers)
     // One column for the labels, so every dropdown's ▾ lines up.
-    const labelWidth = Math.max(0, ...dropdowns.map(p => p.label.length)) + 1
+    const labelWidth = Math.min(LABEL_MAX, Math.max(0, ...dropdowns.map(p => p.label.length))) + 1
     const play = async (id: string) => {
       await update($, station, () => id)
       await update($, query, () => '')
@@ -1022,7 +1104,7 @@ export const register: Register = (on, options) => {
                 <Button
                   key={`station-${source}`}
                   plain
-                  label={clip(`${label.padEnd(labelWidth)}${isOpen ? '▴' : '▾'} ${current}`, e.props.bodyColumns)}
+                  label={clip(`${clip(label, LABEL_MAX).padEnd(labelWidth)}${isOpen ? '▴' : '▾'} ${current}`, e.props.bodyColumns)}
                   // Opening leaves the keyboard on this row: a ring moved into the list
                   // stays lit on its station while the pointer lights another, so
                   // two stations look picked. Tab steps into the list.

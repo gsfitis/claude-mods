@@ -65,6 +65,9 @@ const PANE_PROPS = {
 // reports on its nth read, undefined for a failed read. Every cvlc is pid 4242, and another VLC (pid 111) holds the plain
 // MPRIS name; `busctl` calls land in `busctl`. `stored` is what $.store holds
 // from earlier sessions.
+// `answers` replaces a directory's answer by url and `down` fails those urls;
+// `fetched` and `fetchHeaders` record each request; while `net.hang` is set a
+// request waits until `releaseFetches()` fails it, as a black-holed network does.
 // `files` is the mod's folder as the plugin reads it (file name to text; a test
 // edits it in place); `fsPaths` records each path it asked about.
 const world = (
@@ -80,6 +83,9 @@ const world = (
     output = [] as string[][],
     stored = {} as Record<string, unknown>,
     files = {} as Record<string, string>,
+    answers = {} as Record<string, unknown>,
+    down = [] as string[],
+    net = { hang: false },
   } = {},
 ) => {
   const spawned: string[][] = []
@@ -95,6 +101,7 @@ const world = (
   }
   let loungeFetches = 0
   const fetched: string[] = []
+  const fetchHeaders: Record<string, string>[] = []
   const clock = mock.clock(on)
   const store = { ...stored }
   const fsPaths: string[] = []
@@ -128,13 +135,22 @@ const world = (
   on('command.register', (_$, e) =>
     isRegisterRefused ? { deny: `"/${e.name}" refused: it is a built-in` } : { value: { command: e.name } },
   )
+  const hung: ((error: Error) => void)[] = []
+  const releaseFetches = () => hung.splice(0).forEach(fail => fail(new Error('timed out')))
   on('http.fetch', (_$, e) => {
+    if (net.hang) {
+      fetched.push(e.url)
+
+      return new Promise((_resolve, reject) => hung.push(reject))
+    }
     fetched.push(e.url)
+    fetchHeaders.push({ ...e.init?.headers })
     const isLounge = e.url === LOUNGE_URL
     if (isLounge) loungeFetches += 1
-    if (isLounge ? loungeFetches > loungeFetchesOk : isGreekDown) throw new Error('offline')
+    if (down.includes(e.url) || (isLounge ? loungeFetches > loungeFetchesOk : isGreekDown)) throw new Error('offline')
+    const answer = e.url in answers ? answers[e.url] : isLounge ? lounge : GREEK
 
-    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(isLounge ? lounge : GREEK) } }
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(answer) } }
   })
   on('process.spawn', async function* (_$, e) {
     const url = e.argv[e.argv.length - 1] ?? ''
@@ -205,7 +221,7 @@ const world = (
     return { value: undefined }
   })
 
-  return { clock, pump, spawned, killed, toasts, statuses, busctl, store, panes, files: disk, fsPaths, fetched }
+  return { clock, pump, spawned, killed, toasts, statuses, busctl, store, panes, files: disk, fsPaths, fetched, fetchHeaders, releaseFetches }
 }
 
 test('/radio-fm <station> starts cvlc on its playlist, and a stream that ends turns it off', async ($, on) => {
@@ -1690,7 +1706,9 @@ test('bad entries are skipped and counted: no name, an unknown source, a source 
   await $.session.start(START)
   await $.command.run({ command: 'radio-fm', args: '', ...RUN })
   expect(toasts).toHaveLength(1)
-  expect(toasts[0]).toMatch(/feeds\.json: skipped 11 \(/)
+  expect(toasts[0]).toMatch(
+    /feeds\.json: skipped 11: feed 1, feed 3 "Spotify", feed 4 "No url", feed 5 "Option url", feed 6 "No stations" and 6 more \(/,
+  )
   expect(fetched).toEqual([(LOUNGE_FEED as { url: string }).url])
 
   const ui = await mountPane($)
@@ -1715,4 +1733,649 @@ test('with only fetched feeds and none of their own stations, all unreachable, /
   world(on, { loungeFetchesOk: 0, isGreekDown: true, files: { 'feeds.json': feedsJson(LOUNGE_FEED) } })
   await $.session.start(START)
   expect((await $.command.run({ command: 'radio-fm', args: '', ...RUN })).text).toMatch(/^radio: could not load the station lists \(/)
+})
+
+// Found by review: each test below guards one fix or one gap the review showed.
+const GREEK_URL = GREEK_FEED.url as string
+// Every station id in list order, as /radio-fm lists them for a name it does not know.
+const stationIds = async ($: Engine) =>
+  ((await $.command.run({ command: 'radio-fm', args: 'zzz-none', ...RUN })).text ?? '')
+    .replace(/^No station "zzz-none"\. Stations: /, '')
+    .split(', ')
+// A dropdown's stations, opened and closed again so the next look starts closed.
+const picksOf = async ($: Engine, key: string) => {
+  const ui = await mountPane($)
+  await ui.press({ key: `station-${key}` })
+  const picks = keysOf(await ui.drawn()).filter(k => k.startsWith('pick-'))
+  await ui.press({ key: `close-${key}` })
+  await ui.unmount()
+
+  return picks
+}
+const FAV = { id: 'fav', title: 'Fav', genre: 'Mine', url: 'https://fav.example.com/s', source: 'mine' }
+
+test('a stream url with an option in front and http:// inside never reaches cvlc', async ($, on) => {
+  const evil = { id: 'evil', title: 'Evil FM', genre: 'x', url: '--sout=file/ts:/tmp/owned#http://x', source: 'lounge' }
+  const { clock, spawned, toasts } = world(on, { isStreaming: true, stored: { favorites: [evil] } })
+  await $.session.start(START)
+  await $.command.run({ command: 'radio-fm', args: 'evil', ...RUN })
+  await clock.advance(3000)
+  expect(spawned).toEqual([])
+  expect(toasts).toEqual(['radio: Evil FM has no http(s) stream; not playing it'])
+})
+
+test('feeds.json urls must start with http(s)://, in any case, for a station and for a feed', async ($, on) => {
+  const { clock, spawned, toasts, fetched } = world(on, {
+    isStreaming: true,
+    files: {
+      'feeds.json': feedsJson(
+        {
+          name: 'Mixed',
+          stations: [
+            { title: 'Good', url: 'https://good.example.com' },
+            { title: 'Option', url: '--sout=file/ts:/tmp/owned#http://x' },
+            { title: 'Loud', url: 'HTTPS://caps.example.com/s' },
+          ],
+        },
+        { name: 'Sneaky', source: 'radio-browser', url: '--x#http://dir.example.com' },
+      ),
+    },
+  })
+  await $.session.start(START)
+  expect(await stationIds($)).toEqual(['good', 'loud'])
+  expect(toasts).toEqual([expect.stringContaining('skipped 2: "Mixed" station 2, feed 2 "Sneaky" (')])
+  expect(fetched).toEqual([])
+
+  await $.command.run({ command: 'radio-fm', args: 'loud', ...RUN })
+  await clock.advance(1000)
+  expect(spawned.at(-1)?.at(-1)).toBe('HTTPS://caps.example.com/s')
+})
+
+test('a directory entry with a bad name, url or tags is left out, and the rest still list', async ($, on) => {
+  world(on, {
+    answers: {
+      [GREEK_URL]: [
+        { name: 'Bad url', tags: '', url_resolved: 42 },
+        { name: 7, tags: '', url_resolved: 'https://radio.example.gr/seven' },
+        null,
+        { name: 'Option', tags: '', url_resolved: '--sout=file/x#http://y' },
+        { name: 'No tags', url_resolved: 'https://radio.example.gr/notags' },
+        { name: 'Odd tags', tags: ['rock'], url_resolved: 'https://radio.example.gr/odd' },
+      ],
+    },
+  })
+  await $.session.start(START)
+  expect(await stationIds($)).toEqual(['driftwood', 'nightline', 'kanali-1', 'kanali-2', 'kanali-3', 'no-tags', 'odd-tags'])
+})
+
+test('an empty or broken directory answer is not kept: asked again, the feed keeping its last stations meanwhile', async ($, on) => {
+  const answers: Record<string, unknown> = { [GREEK_URL]: [] }
+  const { files, fetched } = world(on, { answers, files: { 'feeds.json': feedsJson(LOUNGE_FEED, GREEK_FEED) } })
+  await $.session.start(START)
+  const greekFetches = () => fetched.filter(url => url === GREEK_URL).length
+
+  // Empty: only the feed's own stations, and asked again next time.
+  expect(await stationIds($)).toEqual(['driftwood', 'nightline', 'kanali-1', 'kanali-2', 'kanali-3'])
+  answers[GREEK_URL] = GREEK
+  expect(await stationIds($)).toContain('zeppelin-106-7')
+  expect(greekFetches()).toBe(2)
+  // Answered: asked once per load of the mod, not on every look.
+  await stationIds($)
+  expect(greekFetches()).toBe(2)
+
+  // Its url edited to one that answers no list: the feed keeps exactly its own last stations.
+  answers['https://dir.example.com/broken'] = { error: 'not a list' }
+  files['feeds.json'] = feedsJson(LOUNGE_FEED, { ...GREEK_FEED, url: 'https://dir.example.com/broken' })
+  expect(await stationIds($)).toEqual([
+    'driftwood', 'nightline', 'kanali-1', 'kanali-2', 'kanali-3', 'zeppelin-106-7', 'ρυθμος-89-2', 'sfera', 'nightline-greek',
+  ])
+  expect(await picksOf($, 'greek')).not.toContain('pick-driftwood')
+})
+
+test('a feed that answers late never takes an id a listed station already holds', async ($, on) => {
+  const down = [LOUNGE_URL]
+  const chill = { name: 'Chill', stations: [{ title: 'Driftwood', url: 'https://chill.example.com/driftwood' }] }
+  const { clock, spawned } = world(on, { isStreaming: true, down, files: { 'feeds.json': feedsJson(LOUNGE_FEED, chill) } })
+  await $.session.start(START)
+  expect(await stationIds($)).toEqual(['driftwood'])
+  await $.command.run({ command: 'radio-fm', args: 'driftwood', ...RUN })
+  await clock.advance(1000)
+  expect(spawned.at(-1)?.at(-1)).toBe('https://chill.example.com/driftwood')
+
+  // Lounge answers now, and is first in the file: its Driftwood still gives way.
+  down.length = 0
+  expect(await stationIds($)).toEqual(['driftwood-lounge', 'nightline', 'driftwood'])
+  await $.command.run({ command: 'radio-fm', args: 'driftwood', ...RUN })
+  await clock.advance(1000)
+  expect(spawned).toHaveLength(1)
+})
+
+test('an own station\'s "id" is its own, even when a feed listed before it slugs a station to the same id', async ($, on) => {
+  const mine = { name: 'Mine', stations: [{ id: 'driftwood', title: 'My Driftwood', url: 'https://mine.example.com/d' }] }
+  const { clock, spawned } = world(on, { isStreaming: true, files: { 'feeds.json': feedsJson(LOUNGE_FEED, mine) } })
+  await $.session.start(START)
+  expect(await stationIds($)).toEqual(['driftwood-lounge', 'nightline', 'driftwood'])
+  await $.command.run({ command: 'radio-fm', args: 'driftwood', ...RUN })
+  await clock.advance(1000)
+  expect(spawned.at(-1)?.at(-1)).toBe('https://mine.example.com/d')
+})
+
+test('offline, a saved station plays from /radio-fm, and the tick asks for the lists once per 30 s, not every second', async ($, on) => {
+  const { clock, spawned, fetched, toasts } = world(on, {
+    isStreaming: true,
+    down: [LOUNGE_URL],
+    stored: { favorites: [FAV] },
+    files: { 'feeds.json': feedsJson(LOUNGE_FEED) },
+  })
+  await $.session.start(START)
+  expect((await $.command.run({ command: 'radio-fm', args: 'fav', ...RUN })).text).toBe('Tuning to Fav.')
+  await clock.advance(1000)
+  expect(spawned.at(-1)?.at(-1)).toBe('https://fav.example.com/s')
+
+  const asked = fetched.length
+  await clock.advance(10_000)
+  expect(fetched.length).toBe(asked)
+  await clock.advance(30_000)
+  expect(fetched.length - asked).toBeGreaterThan(0)
+  expect(fetched.length - asked).toBeLessThan(4)
+  expect(spawned).toHaveLength(1)
+  expect(toasts).toEqual([])
+})
+
+test('offline, a saved station resumes in a new session', async ($, on) => {
+  const { clock, spawned } = world(on, {
+    isStreaming: true,
+    down: [LOUNGE_URL],
+    stored: { favorites: [FAV], lastStation: 'fav' },
+    files: { 'feeds.json': feedsJson(LOUNGE_FEED) },
+  })
+  await $.session.start(START)
+  await clock.advance(2000)
+  expect(spawned.at(-1)?.at(-1)).toBe('https://fav.example.com/s')
+})
+
+test('one fetched feed down leaves the others; only all down, with no own stations, fails the lists', async ($, on) => {
+  world(on, { isGreekDown: true, files: { 'feeds.json': feedsJson(LOUNGE_FEED, { name: 'Greek', source: 'radio-browser', url: GREEK_URL }) } })
+  await $.session.start(START)
+  expect((await $.command.run({ command: 'radio-fm', args: '', ...RUN })).text).toMatch(/^Radio pane opened/)
+  expect(await stationIds($)).toEqual(['driftwood', 'nightline'])
+})
+
+test('a toast names what was skipped, so a different mistake with the same count is said too', async ($, on) => {
+  const jazz = { ...JAZZ, stations: [...JAZZ.stations, { title: 'Ftp', url: 'ftp://files.example.com/x' }] }
+  const { toasts, files } = world(on, {
+    files: { 'feeds.json': feedsJson(JAZZ, { name: 'Typo', source: 'Radio-Browser', url: GREEK_URL }) },
+  })
+  await $.session.start(START)
+  await stationIds($)
+  expect(toasts).toEqual([expect.stringContaining('skipped 1: feed 2 "Typo" (')])
+
+  files['feeds.json'] = feedsJson(jazz, { name: 'Typo', source: 'radio-browser', url: GREEK_URL })
+  await stationIds($)
+  expect(toasts).toHaveLength(2)
+  expect(toasts[1]).toContain('skipped 1: "Jazz" station 3 (')
+})
+
+test('a feeds.json broken, fixed and broken the same way again is said both times', async ($, on) => {
+  const { toasts, files } = world(on, { files: { 'feeds.json': '{ "feeds": [' } })
+  await $.session.start(START)
+  await stationIds($)
+  files['feeds.json'] = feedsJson(JAZZ)
+  await stationIds($)
+  files['feeds.json'] = '{ "feeds": ['
+  await stationIds($)
+  expect(toasts).toHaveLength(2)
+  expect(toasts[1]).toBe(toasts[0])
+})
+
+test('a feeds.json with no feeds says so, and /radio-fm still opens the pane', async ($, on) => {
+  const { toasts } = world(on, { files: { 'feeds.json': '{ "feeds": [] }' } })
+  await $.session.start(START)
+  expect((await $.command.run({ command: 'radio-fm', args: '', ...RUN })).text).toMatch(/^Radio pane opened/)
+  expect(toasts).toEqual([expect.stringMatching(/^radio: \/.+\/feeds\.json: lists no feeds$/)])
+})
+
+test('a url without a source is said, never fetched, and the feed keeps its own stations', async ($, on) => {
+  const forgot = { name: 'Forgot', url: 'https://dir.example.com/forgot', stations: [{ title: 'Mine', url: 'https://mine.example.com' }] }
+  const { toasts, fetched } = world(on, { files: { 'feeds.json': feedsJson(forgot) } })
+  await $.session.start(START)
+  expect(await stationIds($)).toEqual(['mine'])
+  expect(fetched).toEqual([])
+  expect(toasts).toEqual([expect.stringContaining('skipped 1: feed 1 "Forgot" "url" (no "source") (')])
+})
+
+test('control characters in a feed name, station title or genre never cost the pane', async ($, on) => {
+  const dirty = { name: 'Jazz\u0007', stations: [{ id: 'j', title: 'Jazz\u000724', genre: 'smooth\u0007', url: 'https://jazz.example.com/24' }] }
+  world(on, { files: { 'feeds.json': feedsJson(dirty) } })
+  await $.session.start(START)
+  await $.command.run({ command: 'radio-fm', args: '', ...RUN })
+  const ui = await mountPane($)
+  expect(await dropdownKeys(ui)).toEqual(['station-jazz'])
+  await ui.press({ key: 'station-jazz' })
+  expect(await findKey(ui.drawn(), 'pick-j')).toMatchObject({ props: { label: 'Jazz24 (Jazz · smooth)' } })
+})
+
+test('a feed renamed in place lists its directory under the new name', async ($, on) => {
+  const { files } = world(on, { files: { 'feeds.json': feedsJson(GREEK_FEED) } })
+  await $.session.start(START)
+  await stationIds($)
+  files['feeds.json'] = feedsJson({ ...GREEK_FEED, name: 'Hellas' })
+  await stationIds($)
+  expect(await picksOf($, 'hellas')).toContain('pick-zeppelin-106-7')
+})
+
+test('feeds whose names slug alike, or to nothing, still get keys of their own', async ($, on) => {
+  const station = (title: string) => [{ title, url: `https://${title}.example.com` }]
+  world(on, {
+    files: { 'feeds.json': feedsJson({ name: 'Jazz', stations: station('a') }, { name: 'jazz!', stations: station('b') }, { name: '☕', stations: station('c') }) },
+  })
+  await $.session.start(START)
+  await $.command.run({ command: 'radio-fm', args: '', ...RUN })
+  expect(await dropdownKeys(await mountPane($))).toEqual(['station-jazz', 'station-jazz-2', 'station-feed'])
+})
+
+test('a directory station is skipped when an own station has its id, or its stream over the other scheme', async ($, on) => {
+  const greek = {
+    ...GREEK_FEED,
+    stations: [
+      { id: 'zeppelin-106-7', title: 'Zeppelin (own)', url: 'https://zep.example.com/own' },
+      { title: 'Sfera own', url: 'http://sfera.live24.gr/sfera4132' },
+    ],
+  }
+  world(on, { files: { 'feeds.json': feedsJson(greek) } })
+  await $.session.start(START)
+  expect(await stationIds($)).toEqual(['zeppelin-106-7', 'sfera-own', 'ρυθμος-89-2', 'nightline', 'kanali-news'])
+})
+
+test('radio-browser is told who is asking', async ($, on) => {
+  const { fetched, fetchHeaders } = world(on)
+  await $.session.start(START)
+  await stationIds($)
+  expect(fetched.length).toBeGreaterThan(0)
+  for (const headers of fetchHeaders) expect(headers['User-Agent']).toBe('claude-code-radio-mod/0.1')
+})
+
+test('one long feed name is cut, so it never pads the other dropdowns\' stations out of view', async ($, on) => {
+  world(on, { files: { 'feeds.json': feedsJson(JAZZ, { ...GREEK_FEED, name: 'Greek stations, radio-browser top 40' }) } })
+  await $.session.start(START)
+  await $.command.run({ command: 'radio-fm', args: '', ...RUN })
+  const ui = await mountPane($)
+  const label = async (key: string) => ((await findKey(ui.drawn(), key)) as { props: { label: string } }).props.label
+  expect(await label('station-jazz')).toBe(`${'Jazz'.padEnd(16)}▾ Pick a station…`)
+  expect(await label('station-greek-stations-radio-browser-top-40')).toBe('Greek stations… ▾ Pick a station…')
+})
+
+test('a resumed station in no list, with no feeds to load, is said once and dropped', async ($, on) => {
+  const { clock, spawned, toasts, store } = world(on, {
+    isStreaming: true,
+    stored: { lastStation: 'ghost' },
+    files: { 'feeds.json': '{ "feeds": [] }' },
+  })
+  await $.session.start(START)
+  await clock.advance(5000)
+  expect(spawned).toEqual([])
+  expect(toasts.filter(t => t.includes('"ghost" is in neither station list'))).toHaveLength(1)
+  expect(store.lastStation).toBeUndefined()
+})
+
+// Found by an adversarial review of the tick and of station ids.
+const REC = { id: 'rec', title: 'Rec', genre: 'Mine', url: 'https://rec.example.com/s', source: 'mine' }
+
+test('offline, clearing Recent while its station plays leaves it playing and named', async ($, on) => {
+  const { clock, pump, spawned, killed, toasts } = world(on, {
+    isStreaming: true,
+    down: [LOUNGE_URL],
+    stored: { recent: [REC] },
+    files: { 'feeds.json': feedsJson(LOUNGE_FEED) },
+  })
+  await $.session.start(START)
+  expect((await $.command.run({ command: 'radio-fm', args: 'rec', ...RUN })).text).toBe('Tuning to Rec.')
+  await clock.advance(1000)
+  expect(spawned.at(-1)?.at(-1)).toBe(REC.url)
+
+  expect((await $.command.run({ command: 'radio-fm', args: 'forget all', ...RUN })).text).toBe('Cleared Recent (1).')
+  await clock.advance(5_000)
+  const ui = await mountPane($)
+  const titleAt5s = (await ui.find({ type: 'Text', text: 'Radio off' })) !== undefined ? 'Radio off' : 'shows the station'
+  await clock.advance(26_000)
+  pump()
+  await clock.advance(1000)
+  expect({ titleAt5s, toasts, killed }).toEqual({ titleAt5s: 'shows the station', toasts: [], killed: [] })
+})
+
+test('offline, unstarring the playing favorite leaves it playing', async ($, on) => {
+  const { clock, pump, spawned, killed, toasts } = world(on, {
+    isStreaming: true,
+    down: [LOUNGE_URL],
+    stored: { favorites: [FAV] },
+    files: { 'feeds.json': feedsJson(LOUNGE_FEED) },
+  })
+  await $.session.start(START)
+  await $.command.run({ command: 'radio-fm', args: 'fav', ...RUN })
+  await clock.advance(1000)
+  expect(spawned.at(-1)?.at(-1)).toBe(FAV.url)
+
+  const ui = await mountPane($)
+  expect(await findKey(ui.drawn(), 'favorite')).toMatchObject({ props: { label: '★ Unstar' } })
+  await ui.press({ key: 'favorite' })
+  await clock.advance(31_000)
+  pump()
+  await clock.advance(1000)
+  expect({ toasts, killed }).toEqual({ toasts: [], killed: [] })
+})
+
+test('offline on a network that hangs, Stop still lands at once', async ($, on) => {
+  const net = { hang: false }
+  const { clock, pump, spawned, killed, releaseFetches } = world(on, {
+    isStreaming: true,
+    down: [LOUNGE_URL],
+    net,
+    stored: { favorites: [FAV] },
+    files: { 'feeds.json': feedsJson(LOUNGE_FEED) },
+  })
+  await $.session.start(START)
+  await $.command.run({ command: 'radio-fm', args: 'fav', ...RUN })
+  await clock.advance(1000)
+  expect(spawned).toHaveLength(1)
+
+  // The network now black-holes requests (a dead Wi-Fi, a slow radio-browser).
+  net.hang = true
+  await clock.advance(30_000)
+  await $.command.run({ command: 'radio-fm', args: 'stop', ...RUN })
+  await clock.advance(10_000)
+  pump()
+  await clock.advance(1000)
+  const killedBeforeRelease = [...killed]
+  releaseFetches()
+  await clock.advance(1000)
+  pump()
+  await clock.advance(1000)
+  expect({ killedBeforeRelease, killedAfterRelease: [...killed] }).toEqual({
+    killedBeforeRelease: [FAV.url],
+    killedAfterRelease: [FAV.url],
+  })
+})
+
+test('offline on a network that fails fast, Stop lands at once', async ($, on) => {
+  const { clock, pump, spawned, killed } = world(on, {
+    isStreaming: true,
+    down: [LOUNGE_URL],
+    stored: { favorites: [FAV] },
+    files: { 'feeds.json': feedsJson(LOUNGE_FEED) },
+  })
+  await $.session.start(START)
+  await $.command.run({ command: 'radio-fm', args: 'fav', ...RUN })
+  await clock.advance(1000)
+  expect(spawned).toHaveLength(1)
+  await clock.advance(30_000)
+  await $.command.run({ command: 'radio-fm', args: 'stop', ...RUN })
+  await clock.advance(10_000)
+  pump()
+  await clock.advance(1000)
+  expect(killed).toEqual([FAV.url])
+})
+
+test('offline, /radio-fm still opens the pane when Favorites or Recent can play', async ($, on) => {
+  const { panes } = world(on, {
+    down: [LOUNGE_URL],
+    stored: { favorites: [FAV] },
+    files: { 'feeds.json': feedsJson(LOUNGE_FEED) },
+  })
+  await $.session.start(START)
+  const ran = await $.command.run({ command: 'radio-fm', args: '', ...RUN })
+  expect(ran.text).toMatch(/^Radio pane opened/)
+  expect([...panes]).toEqual(['radio'])
+})
+
+// Stands for /clear or /resume: every radio value reads as never written, as the
+// engine's wipe leaves it (versions restart at 0), while the module and its cvlc go on.
+const wiper = (on: On) => {
+  let shadow: Map<string, { value: unknown; version: number }> | undefined
+  const keyOf = (e: unknown) => {
+    const { plugin, key, id } = e as { plugin: string; key: string; id?: string }
+    return plugin === 'radio' ? `${key}${id === undefined ? '' : `#${id}`}` : undefined
+  }
+  on('state.get', async (_$, e, next) => {
+    const k = keyOf(e)
+    if (shadow === undefined || k === undefined) return next(e)
+    const held = shadow.get(k)
+
+    return { value: held === undefined ? { value: undefined, version: 0 } : { ...held } } as never
+  })
+  on('state.set', async (_$, e, next) => {
+    const k = keyOf(e)
+    if (shadow === undefined || k === undefined) return next(e)
+    const w = e as { value: unknown; ifVersion?: number }
+    const version = shadow.get(k)?.version ?? 0
+    if (w.ifVersion !== undefined && w.ifVersion !== version) return { value: { isSet: false, version } } as never
+    shadow.set(k, { value: w.value, version: version + 1 })
+
+    return { value: { isSet: true, version: version + 1 } } as never
+  })
+
+  return () => {
+    shadow = new Map()
+  }
+}
+
+test('/clear puts the playing station back, and it plays on', async ($, on) => {
+  const wipe = wiper(on)
+  const { clock, pump, spawned, killed, toasts } = world(on, { isStreaming: true, output: PLAYS })
+  await $.session.start(START)
+  await $.command.run({ command: 'radio-fm', args: 'driftwood', ...RUN })
+  await clock.advance(1000)
+  expect(spawned).toHaveLength(1)
+  wipe()
+  await clock.advance(3000)
+  pump()
+  await clock.advance(1000)
+  expect({ spawned: spawned.length, killed, toasts }).toEqual({ spawned: 1, killed: [], toasts: [] })
+  expect(await stationIds($)).toContain('driftwood')
+})
+
+test('/clear never stops a station that plays on after feeds.json was emptied', async ($, on) => {
+  const wipe = wiper(on)
+  const { clock, pump, spawned, killed, toasts, files } = world(on, { isStreaming: true, files: { 'feeds.json': feedsJson(JAZZ) } })
+  await $.session.start(START)
+  await $.command.run({ command: 'radio-fm', args: 'jazz24', ...RUN })
+  await clock.advance(1000)
+  expect(spawned).toHaveLength(1)
+
+  // The feed edited away while it plays: the refresh keeps it listed, as designed.
+  files['feeds.json'] = '{ "feeds": [] }'
+  await clock.advance(31_000)
+  pump()
+  await clock.advance(1000)
+  expect(killed).toEqual([])
+
+  wipe()
+  await clock.advance(3000)
+  pump()
+  await clock.advance(1000)
+  expect({ killed, toasts: toasts.filter(t => !t.includes('lists no feeds')) }).toEqual({ killed: [], toasts: [] })
+})
+
+test('/clear soon after a resume brings the dropdowns back on the next tick, not 30 s later', async ($, on) => {
+  const wipe = wiper(on)
+  const { clock } = world(on, { isStreaming: true, output: PLAYS, stored: { lastStation: 'driftwood' } })
+  await $.session.start(START)
+  await clock.advance(2000)
+  const ui = await mountPane($)
+  expect(await dropdownKeys(ui)).toEqual(['station-lounge', 'station-greek'])
+  await ui.unmount()
+
+  await clock.advance(3000)
+  wipe()
+  await clock.advance(3000)
+  const after = await mountPane($)
+  const at3s = await dropdownKeys(after)
+  await after.unmount()
+  await clock.advance(27_000)
+  const later = await mountPane($)
+  expect({ at3s, at30s: await dropdownKeys(later) }).toEqual({
+    at3s: ['station-lounge', 'station-greek'],
+    at30s: ['station-lounge', 'station-greek'],
+  })
+})
+
+test('online, unstarring a playing favorite its source dropped leaves it playing', async ($, on) => {
+  const gone = { id: 'old-favourite', title: 'Old Favourite 99.9', genre: 'Greek', url: 'https://radio.example.gr/old', source: 'greek' }
+  const { clock, pump, killed, toasts } = world(on, { isStreaming: true, stored: { favorites: [gone] } })
+  await $.session.start(START)
+  await $.command.run({ command: 'radio-fm', args: 'old-favourite', ...RUN })
+  await clock.advance(1000)
+  const ui = await mountPane($)
+  await ui.press({ key: 'favorite' })
+  await clock.advance(2000)
+  pump()
+  await clock.advance(1000)
+  expect({ toasts, killed }).toEqual({ toasts: [], killed: [] })
+})
+
+
+const MINE_D = 'https://mine.example.com/d'
+const LOUNGE_D = 'https://radio.example.com/driftwood'
+
+test('an own "id" added while a station plays leaves the playing station its id, its star and its Recent', async ($, on) => {
+  const { clock, spawned, statuses, store, files } = world(on, {
+    isStreaming: true,
+    output: PLAYS,
+    files: { 'feeds.json': feedsJson(LOUNGE_FEED) },
+  })
+  await $.session.start(START)
+  await $.command.run({ command: 'radio-fm', args: 'driftwood', ...RUN })
+  await clock.advance(1000)
+  expect(spawned.map(a => a.at(-1))).toEqual([LOUNGE_D])
+
+  // The person adds a station of their own and gives it the id they know.
+  files['feeds.json'] = feedsJson(LOUNGE_FEED, { name: 'Mine', stations: [{ id: 'driftwood', title: 'My Driftwood', url: MINE_D }] })
+  const ids = await stationIds($)
+  await clock.advance(1000)
+  const stillPlaying = spawned.length
+  const status = statuses.at(-1)
+  const ui = await mountPane($)
+  const paneTitle = (await ui.find({ type: 'Text', text: '♪ Driftwood' })) !== undefined ? '♪ Driftwood' : (await ui.find({ type: 'Text', text: '♪ My Driftwood' })) !== undefined ? '♪ My Driftwood' : '?'
+  // Star what plays.
+  await ui.press({ key: 'favorite' })
+  const starredUrl = (store.favorites as { url: string }[])[0]?.url
+  await ui.unmount()
+
+  // Stop, then replay it from Recent.
+  await $.command.run({ command: 'radio-fm', args: 'stop', ...RUN })
+  await clock.advance(1000)
+  const ui2 = await mountPane($)
+  await ui2.press({ key: 'recent-1' })
+  await clock.advance(1000)
+
+  expect({
+    ids,
+    stillPlaying,
+    status,
+    paneTitle,
+    starredUrl,
+    recentReplays: spawned.at(-1)?.at(-1),
+    recentUrls: (store.recent as { url: string }[]).map(c => c.url),
+  }).toEqual({
+    ids,
+    stillPlaying: 1,
+    status: '♪ Driftwood',
+    paneTitle: '♪ Driftwood',
+    starredUrl: LOUNGE_D,
+    recentReplays: LOUNGE_D,
+    recentUrls: [LOUNGE_D],
+  })
+})
+
+test('a favorite playing offline keeps its id and stream when a feed answers late with a station of the same id', async ($, on) => {
+  const down = [LOUNGE_URL]
+  const lounge = [...LOUNGE, { name: 'FAV', tags: '', url_resolved: 'https://radio.example.com/fav' }]
+  const { clock, spawned, toasts } = world(on, {
+    isStreaming: true,
+    output: PLAYS,
+    down,
+    lounge,
+    stored: { favorites: [FAV] },
+    files: { 'feeds.json': feedsJson(LOUNGE_FEED) },
+    // The first cvlc plays 50 s, then freezes.
+    position: (child, read) => (child === 1 ? Math.min(read, 10) : read) * 1_000_000,
+  })
+  await $.session.start(START)
+  expect((await $.command.run({ command: 'radio-fm', args: 'fav', ...RUN })).text).toBe('Tuning to Fav.')
+  await clock.advance(1000)
+  expect(spawned.map(a => a.at(-1))).toEqual(['https://fav.example.com/s'])
+
+  // Back online: Lounge answers, and lists a FAV of its own.
+  down.length = 0
+  await listen(clock, 35)
+  const ui = await mountPane($)
+  const midPlayTitle = (await ui.find({ type: 'Text', text: '♪ Fav' })) !== undefined ? '♪ Fav' : (await ui.find({ type: 'Text', text: '♪ FAV' })) !== undefined ? '♪ FAV' : '?'
+  await ui.unmount()
+
+  // The first stream stalls: the watchdog reconnects.
+  await listen(clock, 60)
+
+  expect({
+    midPlayTitle,
+    reconnects: spawned.map(a => a.at(-1)),
+    toasts,
+  }).toEqual({
+    midPlayTitle: '♪ Fav',
+    reconnects: ['https://fav.example.com/s', 'https://fav.example.com/s'],
+    toasts: ['radio: Fav stalled; reconnecting'],
+  })
+})
+
+test('feeds reordered while two share an "id" never stop the station that plays', async ($, on) => {
+  const a = { name: 'A', stations: [{ id: 'x', title: 'X one', url: 'https://a.example.com/x' }] }
+  const b = { name: 'B', stations: [{ id: 'x', title: 'X two', url: 'https://b.example.com/x' }] }
+  const { clock, pump, spawned, killed, toasts, files } = world(on, { isStreaming: true, files: { 'feeds.json': feedsJson(a, b) } })
+  await $.session.start(START)
+  expect(await stationIds($)).toEqual(['x', 'x-b'])
+  await $.command.run({ command: 'radio-fm', args: 'x-b', ...RUN })
+  await clock.advance(1000)
+  expect(spawned.map(s => s.at(-1))).toEqual(['https://b.example.com/x'])
+
+  files['feeds.json'] = feedsJson(b, a)
+  const ids = await stationIds($)
+  await clock.advance(2000)
+  pump()
+  await clock.advance(1000)
+  expect({ ids, killed, toasts }).toEqual({ ids, killed: [], toasts: [] })
+})
+
+test('one stream listed twice in a feed: removing one entry never renames or stops the other', async ($, on) => {
+  const both = { name: 'Mine', stations: [{ title: 'Jazz', url: 'https://one.example.com/s' }, { title: 'Smooth', url: 'https://one.example.com/s' }] }
+  const smooth = { name: 'Mine', stations: [{ title: 'Smooth', url: 'https://one.example.com/s' }] }
+  const { clock, pump, killed, toasts, files } = world(on, { isStreaming: true, files: { 'feeds.json': feedsJson(both) } })
+  await $.session.start(START)
+  expect(await stationIds($)).toEqual(['jazz', 'smooth'])
+  await $.command.run({ command: 'radio-fm', args: 'smooth', ...RUN })
+  await clock.advance(1000)
+
+  files['feeds.json'] = feedsJson(smooth)
+  const ids = await stationIds($)
+  await clock.advance(2000)
+  pump()
+  await clock.advance(1000)
+  expect({ ids, killed, toasts }).toEqual({ ids: ['smooth'], killed: [], toasts: [] })
+})
+
+test('a feed that answers late never takes the id of a listed station, playing or not', async ($, on) => {
+  const down = [LOUNGE_URL]
+  const chill = { name: 'Chill', stations: [{ title: 'Driftwood', url: 'https://chill.example.com/driftwood' }] }
+  world(on, { down, files: { 'feeds.json': feedsJson(LOUNGE_FEED, chill) } })
+  await $.session.start(START)
+  expect(await stationIds($)).toEqual(['driftwood'])
+  down.length = 0
+  expect(await stationIds($)).toEqual(['driftwood-lounge', 'nightline', 'driftwood'])
+})
+
+test('one stream listed twice: each entry keeps its own id across edits, playing or not', async ($, on) => {
+  const jazz = { title: 'Jazz', url: 'https://one.example.com/s' }
+  const smooth = { title: 'Smooth', url: 'https://one.example.com/s' }
+  const { files } = world(on, { files: { 'feeds.json': feedsJson({ name: 'Mine', stations: [jazz, smooth] }) } })
+  await $.session.start(START)
+  expect(await stationIds($)).toEqual(['jazz', 'smooth'])
+  files['feeds.json'] = feedsJson({ name: 'Mine', stations: [smooth] })
+  expect(await stationIds($)).toEqual(['smooth'])
 })
